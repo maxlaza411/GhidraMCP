@@ -20,6 +20,7 @@ MCP Server + Ghidra Plugin
 - Decompile and analyze binaries in Ghidra
 - Automatically rename methods and data
 - List methods, classes, imports, and exports
+- Patch raw bytes directly inside Ghidra's memory blocks
 
 # Installation
 
@@ -49,6 +50,32 @@ https://github.com/user-attachments/assets/75f0c176-6da1-48dc-ad96-c182eb4648c3
 ## MCP Clients
 
 Theoretically, any MCP client should work with ghidraMCP.  Three examples are given below.
+
+## Patching Bytes Safely
+
+The plugin exposes a `/patch_bytes` HTTP endpoint and a corresponding `patch_bytes` MCP tool. This makes it possible to write
+hexadecimal byte sequences into the open program without leaving your MCP client.
+
+- `address` should be any address that Ghidra understands (e.g. `0x140001000`).
+- `data` accepts hexadecimal bytes separated by whitespace or commas. Each token may optionally use a `0x` prefix, and longer
+  hex strings such as `9090` are automatically split into byte pairs.
+- Optionally supply `fill_length` to repeat the provided pattern until the requested number of bytes have been written. The
+  write is clamped so it never crosses the containing memory block boundary.
+
+Example MCP call:
+
+```python
+patch_bytes("0x140001000", "90 90", fill_length=16)
+```
+
+Safety considerations:
+
+- The plugin validates that the target block is writable and automatically clamps the request so you cannot write past the end
+  of that block.
+- After patching code or data, re-run the relevant analyzers (e.g. `Analysis -> Auto Analyze`) so disassembly, function
+  boundaries, and references stay consistent.
+- Saving the program or exporting a diff before patching is recommended when experimenting, and always verify patched bytes in
+  the listing view before continuing analysis.
 
 ## Example 1: Claude Desktop
 To set up Claude Desktop as a Ghidra MCP client, go to `Claude` -> `Settings` -> `Developer` -> `Edit Config` -> `claude_desktop_config.json` and add the following:
