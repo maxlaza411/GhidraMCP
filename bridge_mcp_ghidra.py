@@ -133,6 +133,31 @@ def rename_data(address: str, new_name: str) -> str:
     return safe_post("renameData", {"address": address, "newName": new_name})
 
 @mcp.tool()
+def patch_bytes(address: str, data: str, fill_length: int | None = None) -> str:
+    """
+    Patch raw bytes at the specified address.
+
+    Args:
+        address: Starting address for the write (e.g. "0x140001000").
+        data: Hexadecimal byte pattern. Accepts whitespace or comma separators and optional 0x prefixes.
+        fill_length: Optional total number of bytes to write. If larger than the pattern length,
+            the pattern is repeated to fill the request.
+
+    Returns:
+        Result string describing success or failure.
+    """
+
+    payload = {
+        "address": address,
+        "data": data,
+    }
+
+    if fill_length is not None:
+        payload["fill_length"] = str(fill_length)
+
+    return safe_post("patch_bytes", payload)
+
+@mcp.tool()
 def list_segments(offset: int = 0, limit: int = 100) -> list:
     """
     List all memory segments in the program with pagination.
