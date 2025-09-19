@@ -1,61 +1,59 @@
-name: Build with Maven
+name: Build Ghidra Extension
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      GHIDRA_VERSION: 11.3.2
-      GHIDRA_DATE: 20250415
-      GHIDRA_LIBS: >-
-        Features/Base/lib/Base.jar
-        Features/Decompiler/lib/Decompiler.jar
-        Framework/Docking/lib/Docking.jar
-        Framework/Generic/lib/Generic.jar
-        Framework/Project/lib/Project.jar
-        Framework/SoftwareModeling/lib/SoftwareModeling.jar
-        Framework/Utility/lib/Utility.jar
-        Framework/Gui/lib/Gui.jar
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up JDK 21
-      uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'temurin'
-        cache: maven
+      - uses: actions/checkout@v4
 
-    - name: Download Ghidra
-      run: |
-        wget --no-verbose -O ghidra.zip https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${{ env.GHIDRA_VERSION }}_build/ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC_${{ env.GHIDRA_DATE }}.zip
-        7z x -bd ghidra.zip
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
-    - name: Copy Ghidra libs
-      run: |
-        mkdir -p ./lib
-        for libfile in ${{ env.GHIDRA_LIBS }}
-          do echo "Copying ${libfile} to lib/"
-          cp ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC/Ghidra/${libfile} ./lib/
-        done
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
 
-    - name: Build with Maven
-      run: mvn clean package assembly:single
+      - name: Download Ghidra libraries
+        run: |
+          set -euxo pipefail
+          GHIDRA_VERSION=11.3.2
+          GHIDRA_BUILD=20250415
+          GHIDRA_BASENAME="ghidra_${GHIDRA_VERSION}_PUBLIC"
+          GHIDRA_ARCHIVE="${GHIDRA_BASENAME}_${GHIDRA_BUILD}.zip"
+          curl -L "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/${GHIDRA_ARCHIVE}" -o "$GHIDRA_ARCHIVE"
+          mkdir -p lib
+          unzip -q -j "$GHIDRA_ARCHIVE" \
+            "${GHIDRA_BASENAME}/Ghidra/Features/Base/lib/Base.jar" \
+            "${GHIDRA_BASENAME}/Ghidra/Features/Decompiler/lib/Decompiler.jar" \
+            "${GHIDRA_BASENAME}/Ghidra/Framework/Docking/lib/Docking.jar" \
+            "${GHIDRA_BASENAME}/Ghidra/Framework/Generic/lib/Generic.jar" \
+            "${GHIDRA_BASENAME}/Ghidra/Framework/Project/lib/Project.jar" \
+            "${GHIDRA_BASENAME}/Ghidra/Framework/SoftwareModeling/lib/SoftwareModeling.jar" \
+            "${GHIDRA_BASENAME}/Ghidra/Framework/Utility/lib/Utility.jar" \
+            "${GHIDRA_BASENAME}/Ghidra/Framework/Gui/lib/Gui.jar" \
+            -d lib
+          rm "$GHIDRA_ARCHIVE"
 
-    - name: Assemble release directory
-      run: |
-        mkdir release
-        cp target/GhidraMCP-*-SNAPSHOT.zip release/
-        cp bridge_mcp_ghidra.py release/
+      - name: Build extension
+        run: mvn -B clean package assembly:single
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: GhidraMCP-artifact
-        path: |
-          release/*
+      - name: Upload extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidra-extension
+          path: target/GhidraMCP-*.zip
+          if-no-files-found: error
