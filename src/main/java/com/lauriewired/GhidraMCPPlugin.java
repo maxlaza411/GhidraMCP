@@ -3,6 +3,8 @@ package com.lauriewired;
 import ghidra.framework.plugintool.Plugin;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressFormatException;
+import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.GlobalNamespace;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
@@ -57,6 +59,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @PluginInfo(
     status = PluginStatus.RELEASED,
@@ -181,6 +184,25 @@ public class GhidraMCPPlugin extends Plugin {
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit  = parseIntOrDefault(qparams.get("limit"),  100);
             sendResponse(exchange, listDefinedData(offset, limit));
+        });
+
+        server.createContext("/set_data_type", exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, "Method not allowed. Use POST.");
+                return;
+            }
+
+            String result;
+            try {
+                Map<String, String> params = parsePostParams(exchange);
+                result = setDataTypeAtAddress(params.get("address"), params.get("type"));
+            }
+            catch (IOException e) {
+                Msg.error(this, "Error reading request body for /set_data_type", e);
+                result = "Failed to read request body: " + e.getMessage();
+            }
+
+            sendResponse(exchange, result);
         });
 
         server.createContext("/searchFunctions", exchange -> {
@@ -572,6 +594,99 @@ public class GhidraMCPPlugin extends Plugin {
         catch (InterruptedException | InvocationTargetException e) {
             Msg.error(this, "Failed to execute rename data on Swing thread", e);
         }
+    }
+
+    private String setDataTypeAtAddress(String addressStr, String typeName) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "No program loaded";
+        }
+
+        if (addressStr == null || addressStr.trim().isEmpty()) {
+            return "Parameter 'address' is required";
+        }
+
+        if (typeName == null || typeName.trim().isEmpty()) {
+            return "Parameter 'type' is required";
+        }
+
+        final String normalizedAddress = addressStr.trim();
+        final String normalizedTypeName = typeName.trim();
+
+        AtomicReference<String> messageRef = new AtomicReference<>("No action performed");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                Address addr;
+                try {
+                    addr = program.getAddressFactory().getAddress(normalizedAddress);
+                }
+                catch (AddressFormatException e) {
+                    messageRef.set("Invalid address: " + normalizedAddress);
+                    return;
+                }
+
+                if (addr == null) {
+                    messageRef.set("Invalid address: " + normalizedAddress);
+                    return;
+                }
+
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType resolvedType = resolveDataType(dtm, normalizedTypeName);
+                if (resolvedType == null) {
+                    messageRef.set("Unable to resolve data type: " + normalizedTypeName);
+                    return;
+                }
+
+                int tx = program.startTransaction("Set data type at address");
+                boolean commit = false;
+                try {
+                    Listing listing = program.getListing();
+
+                    Address clearEnd = addr;
+                    int typeLength = resolvedType.getLength();
+                    if (typeLength > 0) {
+                        try {
+                            clearEnd = addr.add(typeLength - 1);
+                        }
+                        catch (AddressOutOfBoundsException e) {
+                            messageRef.set("Data type length exceeds address space: " + e.getMessage());
+                            return;
+                        }
+                    }
+                    else {
+                        CodeUnit existing = listing.getCodeUnitAt(addr);
+                        if (existing != null) {
+                            try {
+                                clearEnd = addr.add(existing.getLength() - 1);
+                            }
+                            catch (AddressOutOfBoundsException e) {
+                                clearEnd = addr;
+                            }
+                        }
+                    }
+
+                    listing.clearCodeUnits(addr, clearEnd, false);
+                    listing.createData(addr, resolvedType);
+
+                    messageRef.set("Applied data type " + resolvedType.getDisplayName() + " at " + addr);
+                    commit = true;
+                }
+                catch (Exception e) {
+                    Msg.error(this, "Failed to apply data type at " + normalizedAddress, e);
+                    messageRef.set("Failed to set data type: " + e.getMessage());
+                }
+                finally {
+                    program.endTransaction(tx, commit);
+                }
+            });
+        }
+        catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute data type update on Swing thread", e);
+            return "Failed to set data type: " + e.getMessage();
+        }
+
+        return messageRef.get();
     }
 
     private String renameVariableInFunction(String functionName, String oldVarName, String newVarName) {

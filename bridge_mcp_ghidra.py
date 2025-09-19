@@ -168,6 +168,26 @@ def list_data_items(offset: int = 0, limit: int = 100) -> list:
     return safe_get("data", {"offset": offset, "limit": limit})
 
 @mcp.tool()
+def set_data_type(address: str, data_type: str) -> str:
+    """Apply a data type to a specific address within the active program.
+
+    Args:
+        address: Address string (e.g. 0x401000 or 00401000) to update.
+        data_type: Name of the desired data type. Supports pointer prefixes and
+            any type present in the program's data type manager.
+
+    Returns:
+        Plain-text status from the Ghidra server describing success (e.g.
+        "Applied data type <type> at <address>") or the specific error that
+        prevented the change.
+    """
+    if not address:
+        return "Error: address is required"
+    if not data_type:
+        return "Error: data_type is required"
+    return safe_post("set_data_type", {"address": address, "type": data_type})
+
+@mcp.tool()
 def search_functions_by_name(query: str, offset: int = 0, limit: int = 100) -> list:
     """
     Search for functions whose name contains the given substring.

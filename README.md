@@ -19,7 +19,23 @@ MCP Server + Ghidra Plugin
 
 - Decompile and analyze binaries in Ghidra
 - Automatically rename methods and data
+- Apply custom data types to addresses remotely
 - List methods, classes, imports, and exports
+
+# Usage Notes
+
+### Remote data type updates
+
+- Issue a `POST` request to the Ghidra plugin's `/set_data_type` endpoint with
+  `address` and `type` form fields to apply a new definition at a specific
+  address. Example: `curl -X POST http://127.0.0.1:8080/set_data_type -d "address=00401000&type=int"`.
+- MCP clients can call the `set_data_type(address, data_type)` tool exposed by
+  `bridge_mcp_ghidra.py`. The tool returns the server's plain-text status (for
+  example, `Applied data type int at 00401000`) or an error explaining what
+  prevented the change.
+- Type names are resolved through the active program's data type manager, so
+  existing user-defined structures and pointer aliases can be referenced by
+  name.
 
 # Installation
 
