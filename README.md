@@ -68,6 +68,8 @@ To set up Claude Desktop as a Ghidra MCP client, go to `Claude` -> `Settings` ->
 }
 ```
 
+If you're analyzing especially large binaries, append `"--http-timeout", "30"` (or another larger value) to the `args` array so each HTTP call has more time to complete. You can also set the `GHIDRA_MCP_HTTP_TIMEOUT` environment variable to adjust the timeout globally.
+
 Alternatively, edit this file directly:
 ```
 /Users/YOUR_USER/Library/Application Support/Claude/claude_desktop_config.json
@@ -79,10 +81,12 @@ The server IP and port are configurable and should be set to point to the target
 To use GhidraMCP with [Cline](https://cline.bot), this requires manually running the MCP server as well. First run the following command:
 
 ```
-python bridge_mcp_ghidra.py --transport sse --mcp-host 127.0.0.1 --mcp-port 8081 --ghidra-server http://127.0.0.1:8080/
+python bridge_mcp_ghidra.py --transport sse --mcp-host 127.0.0.1 --mcp-port 8081 --ghidra-server http://127.0.0.1:8080/ --http-timeout 30
 ```
 
 The only *required* argument is the transport. If all other arguments are unspecified, they will default to the above. Once the MCP server is running, open up Cline and select `MCP Servers` at the top.
+
+> **Tip:** Increase or decrease `--http-timeout` (or set `GHIDRA_MCP_HTTP_TIMEOUT`) based on how long your Ghidra HTTP requests need, especially for large projects.
 
 ![Cline select](https://github.com/user-attachments/assets/88e1f336-4729-46ee-9b81-53271e9c0ce0)
 
