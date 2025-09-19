@@ -53,10 +53,12 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.security.MessageDigest;
 
 @PluginInfo(
     status = PluginStatus.RELEASED,
@@ -70,7 +72,15 @@ public class GhidraMCPPlugin extends Plugin {
     private HttpServer server;
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
     private static final String PORT_OPTION_NAME = "Server Port";
+    private static final String BIND_HOST_OPTION_NAME = "Bind Host";
+    private static final String TOKEN_OPTION_NAME = "Access Token";
     private static final int DEFAULT_PORT = 8080;
+    private static final String DEFAULT_BIND_HOST = "127.0.0.1";
+    private static final String DEFAULT_TOKEN = "";
+
+    private volatile byte[] sharedSecretBytes = new byte[0];
+    private volatile boolean enforceOriginCheck = false;
+    private volatile Set<String> allowedOrigins = Collections.emptySet();
 
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
@@ -82,6 +92,14 @@ public class GhidraMCPPlugin extends Plugin {
             null, // No help location for now
             "The network port number the embedded HTTP server will listen on. " +
             "Requires Ghidra restart or plugin reload to take effect after changing.");
+        options.registerOption(BIND_HOST_OPTION_NAME, DEFAULT_BIND_HOST,
+            null,
+            "The network interface or hostname the HTTP server will bind to. " +
+            "Defaults to 127.0.0.1 for local-only access.");
+        options.registerOption(TOKEN_OPTION_NAME, DEFAULT_TOKEN,
+            null,
+            "Optional shared secret that clients must supply on each request via the " +
+            "X-GhidraMCP-Token header or an Authorization bearer token.");
 
         try {
             startServer();
@@ -93,9 +111,38 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     private void startServer() throws IOException {
-        // Read the configured port
+        // Read configured network parameters
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
         int port = options.getInt(PORT_OPTION_NAME, DEFAULT_PORT);
+        String configuredHost = options.getString(BIND_HOST_OPTION_NAME, DEFAULT_BIND_HOST);
+        if (configuredHost == null || configuredHost.trim().isEmpty()) {
+            configuredHost = DEFAULT_BIND_HOST;
+        }
+        configuredHost = configuredHost.trim();
+
+        String configuredToken = options.getString(TOKEN_OPTION_NAME, DEFAULT_TOKEN);
+        if (configuredToken == null) {
+            configuredToken = DEFAULT_TOKEN;
+        }
+        configuredToken = configuredToken.trim();
+
+        this.sharedSecretBytes = configuredToken.isEmpty()
+            ? new byte[0]
+            : configuredToken.getBytes(StandardCharsets.UTF_8);
+
+        Set<String> originCandidates = buildAllowedOrigins(configuredHost, port);
+        if (originCandidates == null) {
+            this.allowedOrigins = null;
+            this.enforceOriginCheck = true;
+        }
+        else if (originCandidates.isEmpty()) {
+            this.allowedOrigins = Collections.emptySet();
+            this.enforceOriginCheck = false;
+        }
+        else {
+            this.allowedOrigins = Collections.unmodifiableSet(originCandidates);
+            this.enforceOriginCheck = true;
+        }
 
         // Stop existing server if running (e.g., if plugin is reloaded)
         if (server != null) {
@@ -104,151 +151,151 @@ public class GhidraMCPPlugin extends Plugin {
             server = null;
         }
 
-        server = HttpServer.create(new InetSocketAddress(port), 0);
+        server = HttpServer.create(new InetSocketAddress(configuredHost, port), 0);
 
         // Each listing endpoint uses offset & limit from query params:
-        server.createContext("/methods", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/methods", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-            sendResponse(exchange, getAllFunctionNames(offset, limit));
+            sendResponse(ex, getAllFunctionNames(offset, limit));
         });
 
-        server.createContext("/classes", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/classes", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-            sendResponse(exchange, getAllClassNames(offset, limit));
+            sendResponse(ex, getAllClassNames(offset, limit));
         });
 
-        server.createContext("/decompile", exchange -> {
-            String name = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-            sendResponse(exchange, decompileFunctionByName(name));
+        registerContext("/decompile", ex -> {
+            String name = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            sendResponse(ex, decompileFunctionByName(name));
         });
 
-        server.createContext("/renameFunction", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
+        registerContext("/renameFunction", ex -> {
+            Map<String, String> params = parsePostParams(ex);
             String response = renameFunction(params.get("oldName"), params.get("newName"))
                     ? "Renamed successfully" : "Rename failed";
-            sendResponse(exchange, response);
+            sendResponse(ex, response);
         });
 
-        server.createContext("/renameData", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
+        registerContext("/renameData", ex -> {
+            Map<String, String> params = parsePostParams(ex);
             renameDataAtAddress(params.get("address"), params.get("newName"));
-            sendResponse(exchange, "Rename data attempted");
+            sendResponse(ex, "Rename data attempted");
         });
 
-        server.createContext("/renameVariable", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
+        registerContext("/renameVariable", ex -> {
+            Map<String, String> params = parsePostParams(ex);
             String functionName = params.get("functionName");
             String oldName = params.get("oldName");
             String newName = params.get("newName");
             String result = renameVariableInFunction(functionName, oldName, newName);
-            sendResponse(exchange, result);
+            sendResponse(ex, result);
         });
 
-        server.createContext("/segments", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/segments", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-            sendResponse(exchange, listSegments(offset, limit));
+            sendResponse(ex, listSegments(offset, limit));
         });
 
-        server.createContext("/imports", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/imports", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-            sendResponse(exchange, listImports(offset, limit));
+            sendResponse(ex, listImports(offset, limit));
         });
 
-        server.createContext("/exports", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/exports", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-            sendResponse(exchange, listExports(offset, limit));
+            sendResponse(ex, listExports(offset, limit));
         });
 
-        server.createContext("/namespaces", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/namespaces", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-            sendResponse(exchange, listNamespaces(offset, limit));
+            sendResponse(ex, listNamespaces(offset, limit));
         });
 
-        server.createContext("/data", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/data", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-            sendResponse(exchange, listDefinedData(offset, limit));
+            sendResponse(ex, listDefinedData(offset, limit));
         });
 
-        server.createContext("/searchFunctions", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/searchFunctions", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             String searchTerm = qparams.get("query");
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
-            sendResponse(exchange, searchFunctionsByName(searchTerm, offset, limit));
+            sendResponse(ex, searchFunctionsByName(searchTerm, offset, limit));
         });
 
         // New API endpoints based on requirements
         
-        server.createContext("/get_function_by_address", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/get_function_by_address", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             String address = qparams.get("address");
-            sendResponse(exchange, getFunctionByAddress(address));
+            sendResponse(ex, getFunctionByAddress(address));
         });
 
-        server.createContext("/get_current_address", exchange -> {
-            sendResponse(exchange, getCurrentAddress());
+        registerContext("/get_current_address", ex -> {
+            sendResponse(ex, getCurrentAddress());
         });
 
-        server.createContext("/get_current_function", exchange -> {
-            sendResponse(exchange, getCurrentFunction());
+        registerContext("/get_current_function", ex -> {
+            sendResponse(ex, getCurrentFunction());
         });
 
-        server.createContext("/list_functions", exchange -> {
-            sendResponse(exchange, listFunctions());
+        registerContext("/list_functions", ex -> {
+            sendResponse(ex, listFunctions());
         });
 
-        server.createContext("/decompile_function", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/decompile_function", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             String address = qparams.get("address");
-            sendResponse(exchange, decompileFunctionByAddress(address));
+            sendResponse(ex, decompileFunctionByAddress(address));
         });
 
-        server.createContext("/disassemble_function", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/disassemble_function", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             String address = qparams.get("address");
-            sendResponse(exchange, disassembleFunction(address));
+            sendResponse(ex, disassembleFunction(address));
         });
 
-        server.createContext("/set_decompiler_comment", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
+        registerContext("/set_decompiler_comment", ex -> {
+            Map<String, String> params = parsePostParams(ex);
             String address = params.get("address");
             String comment = params.get("comment");
             boolean success = setDecompilerComment(address, comment);
-            sendResponse(exchange, success ? "Comment set successfully" : "Failed to set comment");
+            sendResponse(ex, success ? "Comment set successfully" : "Failed to set comment");
         });
 
-        server.createContext("/set_disassembly_comment", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
+        registerContext("/set_disassembly_comment", ex -> {
+            Map<String, String> params = parsePostParams(ex);
             String address = params.get("address");
             String comment = params.get("comment");
             boolean success = setDisassemblyComment(address, comment);
-            sendResponse(exchange, success ? "Comment set successfully" : "Failed to set comment");
+            sendResponse(ex, success ? "Comment set successfully" : "Failed to set comment");
         });
 
-        server.createContext("/rename_function_by_address", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
+        registerContext("/rename_function_by_address", ex -> {
+            Map<String, String> params = parsePostParams(ex);
             String functionAddress = params.get("function_address");
             String newName = params.get("new_name");
             boolean success = renameFunctionByAddress(functionAddress, newName);
-            sendResponse(exchange, success ? "Function renamed successfully" : "Failed to rename function");
+            sendResponse(ex, success ? "Function renamed successfully" : "Failed to rename function");
         });
 
-        server.createContext("/set_function_prototype", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
+        registerContext("/set_function_prototype", ex -> {
+            Map<String, String> params = parsePostParams(ex);
             String functionAddress = params.get("function_address");
             String prototype = params.get("prototype");
 
@@ -261,15 +308,15 @@ public class GhidraMCPPlugin extends Plugin {
                 if (!result.getErrorMessage().isEmpty()) {
                     successMsg += "\n\nWarnings/Debug Info:\n" + result.getErrorMessage();
                 }
-                sendResponse(exchange, successMsg);
+                sendResponse(ex, successMsg);
             } else {
                 // Return the detailed error message to the client
-                sendResponse(exchange, "Failed to set function prototype: " + result.getErrorMessage());
+                sendResponse(ex, "Failed to set function prototype: " + result.getErrorMessage());
             }
         });
 
-        server.createContext("/set_local_variable_type", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
+        registerContext("/set_local_variable_type", ex -> {
+            Map<String, String> params = parsePostParams(ex);
             String functionAddress = params.get("function_address");
             String variableName = params.get("variable_name");
             String newType = params.get("new_type");
@@ -306,51 +353,374 @@ public class GhidraMCPPlugin extends Plugin {
             String successMsg = success ? "Variable type set successfully" : "Failed to set variable type";
             responseMsg.append("\nResult: ").append(successMsg);
 
-            sendResponse(exchange, responseMsg.toString());
+            sendResponse(ex, responseMsg.toString());
         });
 
-        server.createContext("/xrefs_to", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/xrefs_to", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             String address = qparams.get("address");
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
-            sendResponse(exchange, getXrefsTo(address, offset, limit));
+            sendResponse(ex, getXrefsTo(address, offset, limit));
         });
 
-        server.createContext("/xrefs_from", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/xrefs_from", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             String address = qparams.get("address");
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
-            sendResponse(exchange, getXrefsFrom(address, offset, limit));
+            sendResponse(ex, getXrefsFrom(address, offset, limit));
         });
 
-        server.createContext("/function_xrefs", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/function_xrefs", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             String name = qparams.get("name");
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
-            sendResponse(exchange, getFunctionXrefs(name, offset, limit));
+            sendResponse(ex, getFunctionXrefs(name, offset, limit));
         });
 
-        server.createContext("/strings", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
+        registerContext("/strings", ex -> {
+            Map<String, String> qparams = parseQueryParams(ex);
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String filter = qparams.get("filter");
-            sendResponse(exchange, listDefinedStrings(offset, limit, filter));
+            sendResponse(ex, listDefinedStrings(offset, limit, filter));
         });
 
         server.setExecutor(null);
         new Thread(() -> {
             try {
                 server.start();
-                Msg.info(this, "GhidraMCP HTTP server started on port " + port);
+                Msg.info(this, "GhidraMCP HTTP server started on " + configuredHost + ":" + port);
             } catch (Exception e) {
                 Msg.error(this, "Failed to start HTTP server on port " + port + ". Port might be in use.", e);
                 server = null; // Ensure server isn't considered running
             }
         }, "GhidraMCP-HTTP-Server").start();
+    }
+
+    private void registerContext(String path, CheckedExchangeHandler handler) {
+        server.createContext(path, exchange -> handleRequest(exchange, handler));
+    }
+
+    @FunctionalInterface
+    private interface CheckedExchangeHandler {
+        void handle(HttpExchange exchange) throws Exception;
+    }
+
+    private void handleRequest(HttpExchange exchange, CheckedExchangeHandler handler) {
+        try {
+            AuthorizationResult authResult = authorize(exchange);
+            if (!authResult.allowed) {
+                safeSendResponse(exchange, authResult.statusCode, authResult.message);
+                return;
+            }
+            handler.handle(exchange);
+        }
+        catch (Exception e) {
+            Msg.error(this, "Error handling request for " + exchange.getRequestURI(), e);
+            safeSendResponse(exchange, 500, "Internal server error");
+        }
+        finally {
+            exchange.close();
+        }
+    }
+
+    private AuthorizationResult authorize(HttpExchange exchange) {
+        if (enforceOriginCheck && !isOriginAllowed(exchange)) {
+            Msg.warn(this, "Rejecting request from " + exchange.getRemoteAddress() + " due to disallowed Origin header.");
+            return AuthorizationResult.deny(403, "Origin not allowed");
+        }
+
+        if (sharedSecretBytes.length == 0) {
+            return AuthorizationResult.allow();
+        }
+
+        String providedToken = extractToken(exchange);
+        if (providedToken == null || providedToken.isEmpty()) {
+            Msg.warn(this, "Rejecting request from " + exchange.getRemoteAddress() + " due to missing authentication token.");
+            return AuthorizationResult.deny(401, "Missing authentication token");
+        }
+
+        byte[] providedBytes = providedToken.getBytes(StandardCharsets.UTF_8);
+        if (!MessageDigest.isEqual(sharedSecretBytes, providedBytes)) {
+            Msg.warn(this, "Rejecting request from " + exchange.getRemoteAddress() + " due to invalid authentication token.");
+            return AuthorizationResult.deny(403, "Invalid authentication token");
+        }
+
+        return AuthorizationResult.allow();
+    }
+
+    private boolean isOriginAllowed(HttpExchange exchange) {
+        List<String> originHeaders = exchange.getRequestHeaders().get("Origin");
+        if (originHeaders == null || originHeaders.isEmpty()) {
+            return true;
+        }
+
+        if (allowedOrigins == null) {
+            return originMatchesHostHeader(exchange, originHeaders);
+        }
+
+        if (allowedOrigins.isEmpty()) {
+            return true;
+        }
+
+        for (String origin : originHeaders) {
+            if (origin == null || origin.isBlank() || "null".equalsIgnoreCase(origin)) {
+                return true;
+            }
+
+            try {
+                URI originUri = URI.create(origin);
+                String scheme = originUri.getScheme();
+                String host = originUri.getHost();
+                if (scheme == null || host == null) {
+                    continue;
+                }
+
+                int port = originUri.getPort();
+                if (port == -1) {
+                    port = "https".equalsIgnoreCase(scheme) ? 443 : 80;
+                }
+
+                String normalizedHost = normalizeHostForOrigin(host);
+                String normalizedOrigin = (scheme + "://" + normalizedHost + ":" + port).toLowerCase(Locale.ROOT);
+                if (allowedOrigins.contains(normalizedOrigin)) {
+                    return true;
+                }
+            }
+            catch (IllegalArgumentException e) {
+                Msg.warn(this, "Rejecting request with malformed Origin header: " + origin);
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean originMatchesHostHeader(HttpExchange exchange, List<String> originHeaders) {
+        String hostHeader = exchange.getRequestHeaders().getFirst("Host");
+        if (hostHeader == null || hostHeader.isBlank()) {
+            return false;
+        }
+
+        HostPort requestHost = parseHostAndPort(hostHeader, exchange.getLocalAddress().getPort());
+        if (requestHost == null) {
+            return false;
+        }
+
+        String normalizedRequestHost = normalizeHostForOrigin(requestHost.host).toLowerCase(Locale.ROOT);
+
+        for (String origin : originHeaders) {
+            if (origin == null || origin.isBlank() || "null".equalsIgnoreCase(origin)) {
+                return true;
+            }
+
+            try {
+                URI originUri = URI.create(origin);
+                String originHost = originUri.getHost();
+                if (originHost == null) {
+                    continue;
+                }
+
+                int originPort = originUri.getPort();
+                if (originPort == -1) {
+                    originPort = "https".equalsIgnoreCase(originUri.getScheme()) ? 443 : 80;
+                }
+
+                String normalizedOriginHost = normalizeHostForOrigin(originHost).toLowerCase(Locale.ROOT);
+                if (normalizedOriginHost.equals(normalizedRequestHost) && originPort == requestHost.port) {
+                    return true;
+                }
+            }
+            catch (IllegalArgumentException e) {
+                Msg.warn(this, "Rejecting request with malformed Origin header: " + origin);
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    private HostPort parseHostAndPort(String hostHeader, int defaultPort) {
+        if (hostHeader == null) {
+            return null;
+        }
+
+        String trimmed = hostHeader.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+
+        String host = trimmed;
+        int port = defaultPort;
+
+        if (trimmed.startsWith("[")) {
+            int closingIndex = trimmed.indexOf(']');
+            if (closingIndex < 0) {
+                return null;
+            }
+            host = trimmed.substring(1, closingIndex);
+            if (closingIndex + 1 < trimmed.length() && trimmed.charAt(closingIndex + 1) == ':') {
+                String portPart = trimmed.substring(closingIndex + 2);
+                int parsedPort = parsePort(portPart);
+                port = parsedPort >= 0 ? parsedPort : defaultPort;
+            }
+            return new HostPort(host, port);
+        }
+
+        int colonIndex = trimmed.lastIndexOf(':');
+        if (colonIndex > 0 && trimmed.indexOf(':') == colonIndex) {
+            String hostPart = trimmed.substring(0, colonIndex);
+            String portPart = trimmed.substring(colonIndex + 1);
+            int parsedPort = parsePort(portPart);
+            if (parsedPort >= 0) {
+                host = hostPart;
+                port = parsedPort;
+            }
+            else {
+                host = trimmed;
+            }
+        }
+        else {
+            host = trimmed;
+        }
+
+        return new HostPort(host, port);
+    }
+
+    private int parsePort(String value) {
+        if (value == null) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        }
+        catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private String extractToken(HttpExchange exchange) {
+        List<String> headerTokens = exchange.getRequestHeaders().get("X-GhidraMCP-Token");
+        if (headerTokens != null) {
+            for (String headerToken : headerTokens) {
+                if (headerToken != null && !headerToken.trim().isEmpty()) {
+                    return headerToken.trim();
+                }
+            }
+        }
+
+        String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
+        if (authHeader != null) {
+            String trimmed = authHeader.trim();
+            if (trimmed.regionMatches(true, 0, "Bearer ", 0, 7)) {
+                return trimmed.substring(7).trim();
+            }
+            if (trimmed.regionMatches(true, 0, "Token ", 0, 6)) {
+                return trimmed.substring(6).trim();
+            }
+        }
+
+        Map<String, String> qparams = parseQueryParams(exchange);
+        String queryToken = qparams.get("token");
+        if (queryToken == null) {
+            queryToken = qparams.get("authToken");
+        }
+        if (queryToken != null && !queryToken.trim().isEmpty()) {
+            return queryToken.trim();
+        }
+
+        return null;
+    }
+
+    private Set<String> buildAllowedOrigins(String host, int port) {
+        if (host == null) {
+            return null;
+        }
+
+        String trimmed = host.trim();
+        if (trimmed.isEmpty() || isWildcardHost(trimmed)) {
+            return null;
+        }
+
+        Set<String> origins = new HashSet<>();
+        addOriginForHost(origins, trimmed, port);
+
+        if (isLoopbackHost(trimmed)) {
+            addOriginForHost(origins, "localhost", port);
+            addOriginForHost(origins, "127.0.0.1", port);
+            addOriginForHost(origins, "::1", port);
+        }
+
+        return origins;
+    }
+
+    private void addOriginForHost(Set<String> origins, String host, int port) {
+        String normalizedHost = normalizeHostForOrigin(host);
+        origins.add(("http://" + normalizedHost + ":" + port).toLowerCase(Locale.ROOT));
+        origins.add(("https://" + normalizedHost + ":" + port).toLowerCase(Locale.ROOT));
+    }
+
+    private String normalizeHostForOrigin(String host) {
+        if (host == null) {
+            return "";
+        }
+        if (host.contains(":") && !host.startsWith("[") && !host.endsWith("]")) {
+            return "[" + host + "]";
+        }
+        return host;
+    }
+
+    private boolean isWildcardHost(String host) {
+        String value = host.trim();
+        return value.equals("0.0.0.0") || value.equals("::") || value.equals("0:0:0:0:0:0:0:0") || value.equals("*");
+    }
+
+    private boolean isLoopbackHost(String host) {
+        String value = host.trim().toLowerCase(Locale.ROOT);
+        return value.equals("localhost") || value.equals("127.0.0.1") || value.startsWith("127.") ||
+            value.equals("::1") || value.equals("[::1]") || value.equals("0:0:0:0:0:0:0:1");
+    }
+
+    private void safeSendResponse(HttpExchange exchange, int statusCode, String message) {
+        try {
+            sendResponse(exchange, statusCode, message == null ? "" : message);
+        }
+        catch (IOException ioe) {
+            Msg.error(this, "Failed to send HTTP response", ioe);
+        }
+    }
+
+    private static class HostPort {
+        private final String host;
+        private final int port;
+
+        private HostPort(String host, int port) {
+            this.host = host;
+            this.port = port;
+        }
+    }
+
+    private static class AuthorizationResult {
+        private final boolean allowed;
+        private final int statusCode;
+        private final String message;
+
+        private AuthorizationResult(boolean allowed, int statusCode, String message) {
+            this.allowed = allowed;
+            this.statusCode = statusCode;
+            this.message = message;
+        }
+
+        static AuthorizationResult allow() {
+            return new AuthorizationResult(true, 200, null);
+        }
+
+        static AuthorizationResult deny(int statusCode, String message) {
+            return new AuthorizationResult(false, statusCode, message);
+        }
     }
 
     // ----------------------------------------------------------------------------------
@@ -1630,9 +2000,13 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     private void sendResponse(HttpExchange exchange, String response) throws IOException {
-        byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
+        sendResponse(exchange, 200, response);
+    }
+
+    private void sendResponse(HttpExchange exchange, int statusCode, String response) throws IOException {
+        byte[] bytes = response == null ? new byte[0] : response.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
-        exchange.sendResponseHeaders(200, bytes.length);
+        exchange.sendResponseHeaders(statusCode, bytes.length);
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(bytes);
         }

@@ -37,7 +37,19 @@ First, download the latest [release](https://github.com/LaurieWired/GhidraMCP/re
 4. Select the `GhidraMCP-1-2.zip` (or your chosen version) from the downloaded release
 5. Restart Ghidra
 6. Make sure the GhidraMCPPlugin is enabled in `File` -> `Configure` -> `Developer`
-7. *Optional*: Configure the port in Ghidra with `Edit` -> `Tool Options` -> `GhidraMCP HTTP Server`
+7. *Optional*: Configure the server in Ghidra with `Edit` -> `Tool Options` -> `GhidraMCP HTTP Server`
+
+### HTTP server configuration
+
+The `GhidraMCP HTTP Server` options let you tailor how the embedded service is exposed:
+
+* **Server Port** – TCP port used for the local HTTP listener. Changing the value requires restarting the tool or reloading the plugin.
+* **Bind Host** – Interface or hostname that the server listens on. It defaults to `127.0.0.1` so only the local machine can connect. Set this to a specific address (for example `0.0.0.0` or a LAN IP) if you need to reach the server remotely.
+* **Access Token** – Optional shared secret used to authenticate callers. When a token is configured every request must include it via the `X-GhidraMCP-Token` header or an `Authorization: Bearer <token>` header (a `token=<value>` query parameter also works for quick scripts). Requests missing or presenting the wrong token receive HTTP 401/403 responses and are not processed.
+
+For browsers or other tools that send an `Origin` header, the plugin will only accept requests that originate from the bound host and port (or the host supplied in the request’s `Host` header when using a wildcard bind). This protects the server from cross-origin calls by default.
+
+When enabling remote access always set a strong access token and restrict the bind address to the minimum required surface area.
 
 Video Installation Guide:
 
