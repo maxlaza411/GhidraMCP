@@ -7,6 +7,7 @@
 # ///
 
 import sys
+import os
 import requests
 import argparse
 import logging
@@ -22,6 +23,31 @@ mcp = FastMCP("ghidra-mcp")
 
 # Initialize ghidra_server_url with default value
 ghidra_server_url = DEFAULT_GHIDRA_SERVER
+HTTP_TIMEOUT_ENV_VAR = "GHIDRA_MCP_HTTP_TIMEOUT"
+DEFAULT_HTTP_TIMEOUT = 5.0
+
+
+def _load_http_timeout_from_env() -> float:
+    raw_value = os.getenv(HTTP_TIMEOUT_ENV_VAR)
+    if raw_value is None:
+        return DEFAULT_HTTP_TIMEOUT
+
+    try:
+        timeout = float(raw_value)
+        if timeout <= 0:
+            raise ValueError
+        return timeout
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s value %r; using default %.1f seconds",
+            HTTP_TIMEOUT_ENV_VAR,
+            raw_value,
+            DEFAULT_HTTP_TIMEOUT,
+        )
+        return DEFAULT_HTTP_TIMEOUT
+
+
+http_timeout = _load_http_timeout_from_env()
 
 def safe_get(endpoint: str, params: dict = None) -> list:
     """
@@ -33,12 +59,20 @@ def safe_get(endpoint: str, params: dict = None) -> list:
     url = urljoin(ghidra_server_url, endpoint)
 
     try:
-        response = requests.get(url, params=params, timeout=5)
+        response = requests.get(url, params=params, timeout=http_timeout)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.splitlines()
         else:
             return [f"Error {response.status_code}: {response.text.strip()}"]
+    except requests.exceptions.Timeout:
+        return [
+            (
+                "Request failed: timed out after "
+                f"{http_timeout:g} seconds. Increase it with --http-timeout "
+                f"or set {HTTP_TIMEOUT_ENV_VAR}."
+            )
+        ]
     except Exception as e:
         return [f"Request failed: {str(e)}"]
 
@@ -46,14 +80,20 @@ def safe_post(endpoint: str, data: dict | str) -> str:
     try:
         url = urljoin(ghidra_server_url, endpoint)
         if isinstance(data, dict):
-            response = requests.post(url, data=data, timeout=5)
+            response = requests.post(url, data=data, timeout=http_timeout)
         else:
-            response = requests.post(url, data=data.encode("utf-8"), timeout=5)
+            response = requests.post(url, data=data.encode("utf-8"), timeout=http_timeout)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.strip()
         else:
             return f"Error {response.status_code}: {response.text.strip()}"
+    except requests.exceptions.Timeout:
+        return (
+            "Request failed: timed out after "
+            f"{http_timeout:g} seconds. Increase it with --http-timeout "
+            f"or set {HTTP_TIMEOUT_ENV_VAR}."
+        )
     except Exception as e:
         return f"Request failed: {str(e)}"
 
@@ -93,6 +133,31 @@ def rename_data(address: str, new_name: str) -> str:
     return safe_post("renameData", {"address": address, "newName": new_name})
 
 @mcp.tool()
+def patch_bytes(address: str, data: str, fill_length: int | None = None) -> str:
+    """
+    Patch raw bytes at the specified address.
+
+    Args:
+        address: Starting address for the write (e.g. "0x140001000").
+        data: Hexadecimal byte pattern. Accepts whitespace or comma separators and optional 0x prefixes.
+        fill_length: Optional total number of bytes to write. If larger than the pattern length,
+            the pattern is repeated to fill the request.
+
+    Returns:
+        Result string describing success or failure.
+    """
+
+    payload = {
+        "address": address,
+        "data": data,
+    }
+
+    if fill_length is not None:
+        payload["fill_length"] = str(fill_length)
+
+    return safe_post("patch_bytes", payload)
+
+@mcp.tool()
 def list_segments(offset: int = 0, limit: int = 100) -> list:
     """
     List all memory segments in the program with pagination.
@@ -126,6 +191,26 @@ def list_data_items(offset: int = 0, limit: int = 100) -> list:
     List defined data labels and their values with pagination.
     """
     return safe_get("data", {"offset": offset, "limit": limit})
+
+@mcp.tool()
+def set_data_type(address: str, data_type: str) -> str:
+    """Apply a data type to a specific address within the active program.
+
+    Args:
+        address: Address string (e.g. 0x401000 or 00401000) to update.
+        data_type: Name of the desired data type. Supports pointer prefixes and
+            any type present in the program's data type manager.
+
+    Returns:
+        Plain-text status from the Ghidra server describing success (e.g.
+        "Applied data type <type> at <address>") or the specific error that
+        prevented the change.
+    """
+    if not address:
+        return "Error: address is required"
+    if not data_type:
+        return "Error: data_type is required"
+    return safe_post("set_data_type", {"address": address, "type": data_type})
 
 @mcp.tool()
 def search_functions_by_name(query: str, offset: int = 0, limit: int = 100) -> list:
@@ -288,6 +373,7 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
     return safe_get("strings", params)
 
 def main():
+    global ghidra_server_url, http_timeout
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,
                         help=f"Ghidra server URL, default: {DEFAULT_GHIDRA_SERVER}")
@@ -297,12 +383,24 @@ def main():
                         help="Port to run MCP server on (only used for sse), default: 8081")
     parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse"],
                         help="Transport protocol for MCP, default: stdio")
+    parser.add_argument(
+        "--http-timeout",
+        type=float,
+        default=http_timeout,
+        help=(
+            "HTTP request timeout in seconds. Defaults to the value of "
+            f"{HTTP_TIMEOUT_ENV_VAR} (if set) or {DEFAULT_HTTP_TIMEOUT:.1f}."
+        ),
+    )
     args = parser.parse_args()
-    
+
     # Use the global variable to ensure it's properly updated
-    global ghidra_server_url
     if args.ghidra_server:
         ghidra_server_url = args.ghidra_server
+
+    if args.http_timeout <= 0:
+        parser.error("--http-timeout must be a positive value")
+    http_timeout = args.http_timeout
     
     if args.transport == "sse":
         try:

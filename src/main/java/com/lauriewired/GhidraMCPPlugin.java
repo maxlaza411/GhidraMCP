@@ -3,8 +3,12 @@ package com.lauriewired;
 import ghidra.framework.plugintool.Plugin;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressFormatException;
+import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.GlobalNamespace;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
 import ghidra.program.model.symbol.ReferenceManager;
@@ -59,6 +63,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.security.MessageDigest;
+import java.util.concurrent.atomic.AtomicReference;
 
 @PluginInfo(
     status = PluginStatus.RELEASED,
@@ -230,6 +235,25 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(ex, listDefinedData(offset, limit));
         });
 
+        server.createContext("/set_data_type", exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, "Method not allowed. Use POST.");
+                return;
+            }
+
+            String result;
+            try {
+                Map<String, String> params = parsePostParams(exchange);
+                result = setDataTypeAtAddress(params.get("address"), params.get("type"));
+            }
+            catch (IOException e) {
+                Msg.error(this, "Error reading request body for /set_data_type", e);
+                result = "Failed to read request body: " + e.getMessage();
+            }
+
+            sendResponse(exchange, result);
+        });
+
         registerContext("/searchFunctions", ex -> {
             Map<String, String> qparams = parseQueryParams(ex);
             String searchTerm = qparams.get("query");
@@ -386,6 +410,34 @@ public class GhidraMCPPlugin extends Plugin {
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String filter = qparams.get("filter");
             sendResponse(ex, listDefinedStrings(offset, limit, filter));
+        });
+
+        server.createContext("/patch_bytes", exchange -> {
+            String responseMessage;
+            try {
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                    responseMessage = "Unsupported HTTP method; use POST";
+                }
+                else {
+                    Map<String, String> params = parsePostParams(exchange);
+                    responseMessage = patchBytes(
+                        params.get("address"),
+                        params.get("data"),
+                        params.get("fill_length")
+                    );
+                }
+            }
+            catch (IOException e) {
+                Msg.error(this, "Failed to handle /patch_bytes request", e);
+                responseMessage = "Failed to process patch_bytes request: " + e.getMessage();
+            }
+
+            try {
+                sendResponse(exchange, responseMessage);
+            }
+            catch (IOException e) {
+                Msg.error(this, "Failed to send /patch_bytes response", e);
+            }
         });
 
         server.setExecutor(null);
@@ -942,6 +994,99 @@ public class GhidraMCPPlugin extends Plugin {
         catch (InterruptedException | InvocationTargetException e) {
             Msg.error(this, "Failed to execute rename data on Swing thread", e);
         }
+    }
+
+    private String setDataTypeAtAddress(String addressStr, String typeName) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "No program loaded";
+        }
+
+        if (addressStr == null || addressStr.trim().isEmpty()) {
+            return "Parameter 'address' is required";
+        }
+
+        if (typeName == null || typeName.trim().isEmpty()) {
+            return "Parameter 'type' is required";
+        }
+
+        final String normalizedAddress = addressStr.trim();
+        final String normalizedTypeName = typeName.trim();
+
+        AtomicReference<String> messageRef = new AtomicReference<>("No action performed");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                Address addr;
+                try {
+                    addr = program.getAddressFactory().getAddress(normalizedAddress);
+                }
+                catch (AddressFormatException e) {
+                    messageRef.set("Invalid address: " + normalizedAddress);
+                    return;
+                }
+
+                if (addr == null) {
+                    messageRef.set("Invalid address: " + normalizedAddress);
+                    return;
+                }
+
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType resolvedType = resolveDataType(dtm, normalizedTypeName);
+                if (resolvedType == null) {
+                    messageRef.set("Unable to resolve data type: " + normalizedTypeName);
+                    return;
+                }
+
+                int tx = program.startTransaction("Set data type at address");
+                boolean commit = false;
+                try {
+                    Listing listing = program.getListing();
+
+                    Address clearEnd = addr;
+                    int typeLength = resolvedType.getLength();
+                    if (typeLength > 0) {
+                        try {
+                            clearEnd = addr.add(typeLength - 1);
+                        }
+                        catch (AddressOutOfBoundsException e) {
+                            messageRef.set("Data type length exceeds address space: " + e.getMessage());
+                            return;
+                        }
+                    }
+                    else {
+                        CodeUnit existing = listing.getCodeUnitAt(addr);
+                        if (existing != null) {
+                            try {
+                                clearEnd = addr.add(existing.getLength() - 1);
+                            }
+                            catch (AddressOutOfBoundsException e) {
+                                clearEnd = addr;
+                            }
+                        }
+                    }
+
+                    listing.clearCodeUnits(addr, clearEnd, false);
+                    listing.createData(addr, resolvedType);
+
+                    messageRef.set("Applied data type " + resolvedType.getDisplayName() + " at " + addr);
+                    commit = true;
+                }
+                catch (Exception e) {
+                    Msg.error(this, "Failed to apply data type at " + normalizedAddress, e);
+                    messageRef.set("Failed to set data type: " + e.getMessage());
+                }
+                finally {
+                    program.endTransaction(tx, commit);
+                }
+            });
+        }
+        catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute data type update on Swing thread", e);
+            return "Failed to set data type: " + e.getMessage();
+        }
+
+        return messageRef.get();
     }
 
     private String renameVariableInFunction(String functionName, String oldVarName, String newVarName) {
@@ -1764,7 +1909,7 @@ public class GhidraMCPPlugin extends Plugin {
      */
     private String escapeString(String input) {
         if (input == null) return "";
-        
+
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < input.length(); i++) {
             char c = input.charAt(i);
@@ -1781,6 +1926,195 @@ public class GhidraMCPPlugin extends Plugin {
             }
         }
         return sb.toString();
+    }
+
+    private String patchBytes(String addressStr, String dataStr, String fillLengthStr) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "No program loaded";
+        }
+
+        if (addressStr == null || addressStr.isBlank()) {
+            return "Address is required";
+        }
+        if (dataStr == null || dataStr.isBlank()) {
+            return "Data payload is required";
+        }
+
+        Address address;
+        try {
+            address = program.getAddressFactory().getAddress(addressStr.trim());
+        }
+        catch (AddressFormatException e) {
+            return "Invalid address format: " + e.getMessage();
+        }
+
+        if (address == null) {
+            return "Unable to resolve address: " + addressStr;
+        }
+
+        MemoryBlock block;
+        try {
+            block = requireWritableBlock(program, address);
+        }
+        catch (IllegalArgumentException e) {
+            return e.getMessage();
+        }
+
+        byte[] pattern;
+        try {
+            pattern = parseHexBytePattern(dataStr);
+        }
+        catch (IllegalArgumentException e) {
+            return "Invalid data payload: " + e.getMessage();
+        }
+
+        if (pattern.length == 0) {
+            return "Data payload must contain at least one byte";
+        }
+
+        Integer fillLength = null;
+        if (fillLengthStr != null && !fillLengthStr.isBlank()) {
+            try {
+                fillLength = Integer.parseInt(fillLengthStr.trim());
+            }
+            catch (NumberFormatException e) {
+                return "Invalid fill_length value: " + fillLengthStr;
+            }
+
+            if (fillLength <= 0) {
+                return "fill_length must be positive";
+            }
+        }
+
+        int desiredLength = fillLength != null ? fillLength : pattern.length;
+        if (desiredLength <= 0) {
+            return "No bytes requested for patch";
+        }
+
+        int writeLength = clampLengthToBlock(block, address, desiredLength);
+        if (writeLength <= 0) {
+            return "No writable space remaining in block \"" + block.getName() + "\"";
+        }
+
+        byte[] bytesToWrite = expandPattern(pattern, writeLength);
+        boolean truncated = writeLength < desiredLength;
+
+        Memory memory = program.getMemory();
+        AtomicBoolean success = new AtomicBoolean(false);
+        AtomicReference<String> message = new AtomicReference<>("Failed to patch bytes");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Patch bytes via HTTP");
+                try {
+                    memory.setBytes(address, bytesToWrite);
+                    success.set(true);
+
+                    StringBuilder sb2 = new StringBuilder();
+                    sb2.append("Patched ").append(writeLength)
+                       .append(writeLength == 1 ? " byte" : " bytes")
+                       .append(" at ").append(address)
+                       .append(" in block ").append(block.getName());
+                    if (truncated) {
+                        sb2.append(" (clamped to block boundary)");
+                    }
+                    message.set(sb2.toString());
+                }
+                catch (MemoryAccessException e) {
+                    Msg.error(this, "Failed to patch bytes", e);
+                    message.set("Failed to patch bytes: " + e.getMessage());
+                }
+                finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        }
+        catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to patch bytes on Swing thread", e);
+            return "Failed to patch bytes: " + e.getMessage();
+        }
+
+        return message.get();
+    }
+
+    private MemoryBlock requireWritableBlock(Program program, Address start) {
+        Memory memory = program.getMemory();
+        MemoryBlock block = memory.getBlock(start);
+        if (block == null || !block.contains(start)) {
+            throw new IllegalArgumentException("Address " + start + " is not within a memory block");
+        }
+        if (!block.isInitialized()) {
+            throw new IllegalArgumentException("Memory block \"" + block.getName() + "\" is not initialized");
+        }
+        if (!block.isWrite()) {
+            throw new IllegalArgumentException("Memory block \"" + block.getName() + "\" is read-only");
+        }
+        return block;
+    }
+
+    private int clampLengthToBlock(MemoryBlock block, Address start, int requestedLength) {
+        if (requestedLength <= 0) {
+            return 0;
+        }
+
+        long bytesRemaining = (block.getEnd().getOffset() - start.getOffset()) + 1;
+        if (bytesRemaining <= 0) {
+            return 0;
+        }
+
+        return (int) Math.min(bytesRemaining, (long) requestedLength);
+    }
+
+    private byte[] expandPattern(byte[] pattern, int targetLength) {
+        byte[] expanded = new byte[targetLength];
+        for (int i = 0; i < targetLength; i++) {
+            expanded[i] = pattern[i % pattern.length];
+        }
+        return expanded;
+    }
+
+    private byte[] parseHexBytePattern(String dataStr) {
+        String trimmed = dataStr.trim();
+        if (trimmed.isEmpty()) {
+            return new byte[0];
+        }
+
+        List<Byte> bytes = new ArrayList<>();
+        String[] tokens = trimmed.split("[\\s,]+");
+        for (String token : tokens) {
+            if (token.isEmpty()) {
+                continue;
+            }
+
+            String cleaned = token.startsWith("0x") || token.startsWith("0X")
+                ? token.substring(2)
+                : token;
+
+            if (cleaned.isEmpty()) {
+                throw new IllegalArgumentException("Empty hex token provided");
+            }
+            if ((cleaned.length() & 1) != 0) {
+                throw new IllegalArgumentException("Hex token must have even length: " + token);
+            }
+
+            for (int i = 0; i < cleaned.length(); i += 2) {
+                String byteStr = cleaned.substring(i, i + 2);
+                try {
+                    int value = Integer.parseInt(byteStr, 16);
+                    bytes.add((byte) value);
+                }
+                catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("Invalid hex byte '" + byteStr + "' in token: " + token);
+                }
+            }
+        }
+
+        byte[] result = new byte[bytes.size()];
+        for (int i = 0; i < bytes.size(); i++) {
+            result[i] = bytes.get(i);
+        }
+        return result;
     }
 
     /**

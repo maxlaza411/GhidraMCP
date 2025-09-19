@@ -19,7 +19,24 @@ MCP Server + Ghidra Plugin
 
 - Decompile and analyze binaries in Ghidra
 - Automatically rename methods and data
+- Apply custom data types to addresses remotely
 - List methods, classes, imports, and exports
+- Patch raw bytes directly inside Ghidra's memory blocks
+
+# Usage Notes
+
+### Remote data type updates
+
+- Issue a `POST` request to the Ghidra plugin's `/set_data_type` endpoint with
+  `address` and `type` form fields to apply a new definition at a specific
+  address. Example: `curl -X POST http://127.0.0.1:8080/set_data_type -d "address=00401000&type=int"`.
+- MCP clients can call the `set_data_type(address, data_type)` tool exposed by
+  `bridge_mcp_ghidra.py`. The tool returns the server's plain-text status (for
+  example, `Applied data type int at 00401000`) or an error explaining what
+  prevented the change.
+- Type names are resolved through the active program's data type manager, so
+  existing user-defined structures and pointer aliases can be referenced by
+  name.
 
 # Installation
 
@@ -62,6 +79,32 @@ https://github.com/user-attachments/assets/75f0c176-6da1-48dc-ad96-c182eb4648c3
 
 Theoretically, any MCP client should work with ghidraMCP.  Three examples are given below.
 
+## Patching Bytes Safely
+
+The plugin exposes a `/patch_bytes` HTTP endpoint and a corresponding `patch_bytes` MCP tool. This makes it possible to write
+hexadecimal byte sequences into the open program without leaving your MCP client.
+
+- `address` should be any address that Ghidra understands (e.g. `0x140001000`).
+- `data` accepts hexadecimal bytes separated by whitespace or commas. Each token may optionally use a `0x` prefix, and longer
+  hex strings such as `9090` are automatically split into byte pairs.
+- Optionally supply `fill_length` to repeat the provided pattern until the requested number of bytes have been written. The
+  write is clamped so it never crosses the containing memory block boundary.
+
+Example MCP call:
+
+```python
+patch_bytes("0x140001000", "90 90", fill_length=16)
+```
+
+Safety considerations:
+
+- The plugin validates that the target block is writable and automatically clamps the request so you cannot write past the end
+  of that block.
+- After patching code or data, re-run the relevant analyzers (e.g. `Analysis -> Auto Analyze`) so disassembly, function
+  boundaries, and references stay consistent.
+- Saving the program or exporting a diff before patching is recommended when experimenting, and always verify patched bytes in
+  the listing view before continuing analysis.
+
 ## Example 1: Claude Desktop
 To set up Claude Desktop as a Ghidra MCP client, go to `Claude` -> `Settings` -> `Developer` -> `Edit Config` -> `claude_desktop_config.json` and add the following:
 
@@ -80,6 +123,8 @@ To set up Claude Desktop as a Ghidra MCP client, go to `Claude` -> `Settings` ->
 }
 ```
 
+If you're analyzing especially large binaries, append `"--http-timeout", "30"` (or another larger value) to the `args` array so each HTTP call has more time to complete. You can also set the `GHIDRA_MCP_HTTP_TIMEOUT` environment variable to adjust the timeout globally.
+
 Alternatively, edit this file directly:
 ```
 /Users/YOUR_USER/Library/Application Support/Claude/claude_desktop_config.json
@@ -91,10 +136,12 @@ The server IP and port are configurable and should be set to point to the target
 To use GhidraMCP with [Cline](https://cline.bot), this requires manually running the MCP server as well. First run the following command:
 
 ```
-python bridge_mcp_ghidra.py --transport sse --mcp-host 127.0.0.1 --mcp-port 8081 --ghidra-server http://127.0.0.1:8080/
+python bridge_mcp_ghidra.py --transport sse --mcp-host 127.0.0.1 --mcp-port 8081 --ghidra-server http://127.0.0.1:8080/ --http-timeout 30
 ```
 
 The only *required* argument is the transport. If all other arguments are unspecified, they will default to the above. Once the MCP server is running, open up Cline and select `MCP Servers` at the top.
+
+> **Tip:** Increase or decrease `--http-timeout` (or set `GHIDRA_MCP_HTTP_TIMEOUT`) based on how long your Ghidra HTTP requests need, especially for large projects.
 
 ![Cline select](https://github.com/user-attachments/assets/88e1f336-4729-46ee-9b81-53271e9c0ce0)
 
